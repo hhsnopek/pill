@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -9,27 +10,41 @@ import (
 	"log"
 	"net/http"
 	"net/http/httptrace"
+	"net/url"
 	"os"
 	"time"
 )
 
 // TODO
-// - slack notification
+// - switch to queue system to limit messages sent to slack
 // - save somewhere
 
+type Status struct {
+	URL     string
+	Status  string
+	Latency time.Duration
+}
+
+type SiteConfig struct {
+	URL          string `json:"url"`
+	SlackChannel string `json:"channel,omitempty"`
+	When         string `json:"cron-expression,omitempty"`
+}
+
 type SlackConfig struct {
-	SlackKey     string `json:"key"`
-	SlackChannel string `json:"channel"`
+	Webhook string `json:"WebHook"`
+	Channel string `json:"channel"`
 }
 
 type Config struct {
-	Slack SlackConfig `json:"slack"`
-	When  string      `json:"cron-expression"`
-	Sites []string    `json:"sites"`
+	Slack SlackConfig  `json:"slack"`
+	When  string       `json:"cron-expression"`
+	Sites []SiteConfig `json:"sites"`
 }
 
 func main() {
-	configFile, err := ioutil.ReadFile("./healthconfig.json")
+	// Setup config
+	configFile, err := ioutil.ReadFile("./pill.json")
 	if err != nil {
 		log.Fatalf("Error: %v", err)
 		os.Exit(1)
@@ -37,19 +52,40 @@ func main() {
 
 	var config Config
 	json.Unmarshal(configFile, &config)
+
+	// setup cron jobs
 	c := cron.New()
 	when := config.When
 	sites := config.Sites
+	channel := config.Slack.Channel
+	webhook := config.Slack.Webhook
 
-	for _, site := range sites {
-		c.AddFunc(when, func() { trace(site) })
+	// create msg queue
+	queue := make(chan int)
+
+	for i, site := range sites {
+		queue <- i
+		if site.SlackChannel != "" {
+			channel = site.SlackChannel
+		}
+		if site.When != "" {
+			when = site.When
+		}
+		c.AddFunc(when, func() { trace(site.URL, channel, webhook, queue) })
+	}
+
+	limiter := time.Tick(time.Millisecond * 200)
+
+	for _ := range queue {
+		<-limiter
 	}
 
 	c.Start() // start...
 	select {} // and don't stop
+	close(queue)
 }
 
-func trace(URL string) {
+func trace(URL, channel, webhook string, queue chan<- Status) {
 	req, _ := http.NewRequest("GET", URL, nil)
 
 	var startTime, DNSTime time.Time
@@ -82,21 +118,41 @@ func trace(URL string) {
 		startTime = DNSTime
 	}
 
+	latency := endTime.Sub(startTime)
 	if resp.StatusCode != 200 {
-		reportProblem(URL, resp)
+		reportProblem(URL, channel, webhook, latency, resp)
 	}
 
-	// save(URL, resp.StatusCode, endTime.Sub(startTime))
-	log.Printf("GET\t%s (%v) - %v", URL, resp.StatusCode, endTime.Sub(startTime))
+	save(URL, resp.StatusCode, latency)
 	return
 }
 
-func reportProblem(URL string, resp *http.Response) {
-	statusCode := resp.StatusCode
-	msg := fmt.Sprintf("%s - (%v) %s", URL, statusCode, http.StatusText(statusCode))
-	pingSlack(msg)
+func save(URL string, code int, latency time.Duration) {
+	log.Printf("GET\t%s (%v) - %v", URL, code, latency)
 }
 
-func pingSlack(msg string) {
-	log.Println(msg)
+func reportProblem(URL, channel, webhook string, latency time.Duration, resp *http.Response) {
+	statusCode := resp.StatusCode
+	msg := fmt.Sprintf("%s isn't swallowing any pills\n> (%v:%v) %s", URL, statusCode, latency, http.StatusText(statusCode))
+	pingSlack(msg, channel, webhook)
+}
+
+func pingSlack(msg, channel, webhook string) {
+	data := url.Values{}
+	username := "Pill Pusher"
+	icon := ":pill:"
+	payload := fmt.Sprintf("{'channel': '%s', 'username': '%s', 'text': '%s', 'icon_emoji': '%s'}", channel, username, msg, icon)
+	data.Set("payload", payload)
+
+	client := &http.Client{}
+	req, _ := http.NewRequest("POST", webhook, bytes.NewBufferString(data.Encode()))
+	req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Print(err.Error())
+	}
+	if resp.StatusCode != 200 {
+		log.Print(resp.Status)
+	}
 }
