@@ -1,0 +1,18 @@
+{
+  "slack": {
+    "webhook": "",
+    "channel": ""
+  },
+  "cron-expression": "@every 5s",
+  "sites": [
+    {
+      "url": "https://google.com"
+    },
+    {
+      "url": "https://youtube.com",
+      "slack-channel": "#youtube",
+      "When": "@every 1s"
+    }
+  ]
+}
+
